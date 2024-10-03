@@ -128,14 +128,14 @@ import subprocess
 import re
 
 from ansible.errors import AnsibleError, AnsibleFileNotFound, AnsibleConnectionFailure
-from ansible.module_utils.six.moves import shlex_quote
+from ansible.module_utils.six.moves import shlex_quote # type: ignore
 from ansible.module_utils.six import string_types
 from ansible.module_utils.common.process import get_bin_path
 from ansible.module_utils.common.text.converters import to_bytes, to_native, to_text
 from ansible.plugins.connection import ConnectionBase, BUFSIZE
 from ansible.utils.display import Display
 
-from ansible_collections.community.docker.plugins.module_utils.selectors import selectors
+from ansible_collections.community.docker.plugins.module_utils.selectors import selectors # type: ignore
 from ansible_collections.community.docker.plugins.module_utils.version import LooseVersion
 
 display = Display()
@@ -433,81 +433,146 @@ class Connection(ConnectionBase):
             return os.path.normpath(remote_path)
 
     def put_file(self, in_path, out_path):
-        """ Transfer a file from local to docker container """
+        """ Transfer a file from local to docker container, supporting both Linux and Windows containers """
         self._set_conn_data()
         super(Connection, self).put_file(in_path, out_path)
+
         display.vvv("PUT %s TO %s" % (in_path, out_path), host=self.get_option('remote_addr'))
 
-        out_path = self._prefix_login_path(out_path)
         if not os.path.exists(to_bytes(in_path, errors='surrogate_or_strict')):
             raise AnsibleFileNotFound(
                 "file or module does not exist: %s" % to_native(in_path))
 
-        out_path = shlex_quote(out_path)
-        # Older docker doesn't have native support for copying files into
-        # running containers, so we use docker exec to implement this
-        # Although docker version 1.8 and later provide support, the
-        # owner and group of the files are always set to root
-        with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
-            if not os.fstat(in_file.fileno()).st_size:
-                count = ' count=0'
-            else:
-                count = ''
-            args = self._build_exec_cmd([self._play_context.executable, "-c", "dd of=%s bs=%s%s" % (out_path, BUFSIZE, count)])
-            args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
-            try:
-                p = subprocess.Popen(args, stdin=in_file, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except OSError:
-                raise AnsibleError("docker connection requires dd command in the container to put files")
+        container_name = self.get_option('remote_addr')
+
+        # Execute 'docker inspect' to determine if the container is Windows
+        inspect_cmd = ['docker', 'inspect', '--format', '{{.Platform}}', container_name]
+        try:
+            p = subprocess.Popen(inspect_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
             stdout, stderr = p.communicate()
+            container_platform = stdout.strip().decode('utf-8')
 
-            if p.returncode != 0:
-                raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" %
-                                   (to_native(in_path), to_native(out_path), to_native(stdout), to_native(stderr)))
+            display.vvv(f"Docker version is: {self.docker_version} ")
+            display.vvv(f"Container Platform detected: {container_platform}")
 
-    def fetch_file(self, in_path, out_path):
-        """ Fetch a file from container to local. """
-        self._set_conn_data()
-        super(Connection, self).fetch_file(in_path, out_path)
-        display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.get_option('remote_addr'))
+            # If the container is running Windows, use docker cp to transfer the file
+            if container_platform.lower() == 'windows':
+                out_path = out_path.replace('\\', '/')
+                display.vvv(f"Adjusted out_path for Windows container: {out_path}")
 
-        in_path = self._prefix_login_path(in_path)
-        # out_path is the final file path, but docker takes a directory, not a
-        # file path
-        out_dir = os.path.dirname(out_path)
+                args = ['docker', 'cp', in_path, f'{container_name}:{out_path}']
+                display.vvv(f"Docker cp command: {' '.join(args)}")
 
-        args = [self.docker_cmd, "cp", "%s:%s" % (self.get_option('remote_addr'), in_path), out_dir]
-        args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
-
-        p = subprocess.Popen(args, stdin=subprocess.PIPE,
-                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        p.communicate()
-
-        if getattr(self._shell, "_IS_WINDOWS", False):
-            import ntpath
-            actual_out_path = ntpath.join(out_dir, ntpath.basename(in_path))
-        else:
-            actual_out_path = os.path.join(out_dir, os.path.basename(in_path))
-
-        if p.returncode != 0:
-            # Older docker doesn't have native support for fetching files command `cp`
-            # If `cp` fails, try to use `dd` instead
-            args = self._build_exec_cmd([self._play_context.executable, "-c", "dd if=%s bs=%s" % (in_path, BUFSIZE)])
-            args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
-            with open(to_bytes(actual_out_path, errors='surrogate_or_strict'), 'wb') as out_file:
-                try:
-                    p = subprocess.Popen(args, stdin=subprocess.PIPE,
-                                         stdout=out_file, stderr=subprocess.PIPE)
-                except OSError:
-                    raise AnsibleError("docker connection requires dd command in the container to put files")
+                p = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 stdout, stderr = p.communicate()
 
                 if p.returncode != 0:
-                    raise AnsibleError("failed to fetch file %s to %s:\n%s\n%s" % (in_path, out_path, stdout, stderr))
+                    raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" %
+                                      (to_native(in_path), to_native(out_path), to_native(stdout), to_native(stderr)))
+            else:
+                # Fallback to original method using dd for Linux containers
+                out_path = shlex_quote(out_path)
+                # Older docker doesn't have native support for copying files into
+                # running containers, so we use docker exec to implement this
+                # Although docker version 1.8 and later provide support, the
+                # owner and group of the files are always set to root
+                with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
+                    if not os.fstat(in_file.fileno()).st_size:
+                        count = ' count=0'
+                    else:
+                        count = ''
+                    args = self._build_exec_cmd([self._play_context.executable, "-c", "dd of=%s bs=%s%s" % (out_path, BUFSIZE, count)])
 
-        # Rename if needed
-        if actual_out_path != out_path:
-            os.rename(to_bytes(actual_out_path, errors='strict'), to_bytes(out_path, errors='strict'))
+                    display.vvv("This is the args before to_bytes %s" % args)
+
+                    args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
+
+                    try:
+                        p = subprocess.Popen(args, stdin=in_file, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                    except OSError:
+                        raise AnsibleError("docker connection requires dd command in the container to put files")
+                    stdout, stderr = p.communicate()
+
+                    if p.returncode != 0:
+                        raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" % 
+                                           (to_native(in_path), to_native(out_path), to_native(stdout), to_native(stderr)))
+
+        except OSError as e:
+            raise AnsibleError(f"Docker connection requires docker to be installed and accessible: {str(e)}")
+
+    def fetch_file(self, in_path, out_path):
+        """ Fetch a file from container to local, supporting both Linux and Windows containers. """
+        self._set_conn_data()
+        super(Connection, self).fetch_file(in_path, out_path)
+        
+        display.vvv("FETCH %s TO %s" % (in_path, out_path), host=self.get_option('remote_addr'))
+
+        # Get the directory for the out_path
+        out_dir = os.path.dirname(out_path)
+        
+        # Determine if the container is running Windows
+        container_name = self.get_option('remote_addr')
+
+        # Use 'docker inspect' to check the platform
+        inspect_cmd = ['docker', 'inspect', '--format', '{{.Platform}}', container_name]
+        try:
+            p = subprocess.Popen(inspect_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = p.communicate()
+            container_platform = stdout.strip().decode('utf-8')
+
+            display.vvv(f"Docker version is: {self.docker_version} ")
+            display.vvv(f"Container Platform detected: {container_platform}")
+
+            # If the container is Windows, use docker cp with adjusted paths
+            if container_platform.lower() == 'windows':
+                in_path = in_path.replace('\\', '/')
+                display.vvv(f"Adjusted in_path for Windows container: {in_path}")
+
+                # Use docker cp to fetch the file
+                args = ['docker', 'cp', f'{container_name}:{in_path}', out_dir]
+                display.vvv(f"Docker cp command: {' '.join(args)}")
+
+                p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p.communicate()
+
+                if p.returncode != 0:
+                    raise AnsibleError(f"failed to fetch file {in_path} to {out_path}")
+
+                # Handle the correct path construction on Windows
+                import ntpath
+                actual_out_path = ntpath.join(out_dir, ntpath.basename(in_path))
+
+            else:
+                # Fallback for Linux containers using docker cp
+                args = [self.docker_cmd, "cp", "%s:%s" % (self.get_option('remote_addr'), in_path), out_dir]
+                args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
+
+                p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                p.communicate()
+
+                if p.returncode != 0:
+                    # If docker cp fails, use dd for older Linux containers
+                    actual_out_path = os.path.join(out_dir, os.path.basename(in_path))
+                    args = self._build_exec_cmd([self._play_context.executable, "-c", "dd if=%s bs=%s" % (in_path, BUFSIZE)])
+                    args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
+                    with open(to_bytes(actual_out_path, errors='surrogate_or_strict'), 'wb') as out_file:
+                        try:
+                            p = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=out_file, stderr=subprocess.PIPE)
+                        except OSError:
+                            raise AnsibleError("docker connection requires dd command in the container to fetch files")
+                        stdout, stderr = p.communicate()
+
+                        if p.returncode != 0:
+                            raise AnsibleError("failed to fetch file %s to %s:\n%s\n%s" %
+                                            (in_path, out_path, stdout, stderr))
+
+            # Rename the file to the desired location if necessary
+            if actual_out_path != out_path:
+                os.rename(to_bytes(actual_out_path, errors='strict'), to_bytes(out_path, errors='strict'))
+
+        except OSError as e:
+            raise AnsibleError(f"Docker connection requires docker to be installed and accessible: {str(e)}")
+
 
     def close(self):
         """ Terminate the connection. Nothing to do for Docker"""
