@@ -432,6 +432,32 @@ class Connection(ConnectionBase):
                 remote_path = os.path.join(os.path.sep, remote_path)
             return os.path.normpath(remote_path)
 
+    def transfer_file(self, from_path, to_path):
+        """ Transfer file between host and docker container """
+        self._set_conn_data()
+        super(Connection, self).transfer_file(from_path, to_path)
+
+        # Older docker doesn't have native support for copying files into
+        # running containers, so we use docker exec to implement this
+        # Although docker version 1.8 and later provide support, the
+        # owner and group of the files are always set to root
+        with open(to_bytes(from_path, errors='surrogate_or_strict'), 'rb') as in_file:
+            if not os.fstat(in_file.fileno()).st_size:
+                count = ' count=0'
+            else:
+                count = ''
+            args = self._build_exec_cmd([self._play_context.executable, "-c", "dd of=%s bs=%s%s" % (to_path, BUFSIZE, count)])
+            args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
+            try:
+                p = subprocess.Popen(args, stdin=in_file, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            except OSError:
+                raise AnsibleError("docker connection requires dd command in the container to put files")
+            stdout, stderr = p.communicate()
+
+            if p.returncode != 0:
+                raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" %
+                                   (to_native(from_path), to_native(to_path), to_native(stdout), to_native(stderr)))
+
     def put_file(self, in_path, out_path):
         """ Transfer a file from local to docker container """
         self._set_conn_data()
@@ -444,26 +470,8 @@ class Connection(ConnectionBase):
                 "file or module does not exist: %s" % to_native(in_path))
 
         out_path = shlex_quote(out_path)
-        # Older docker doesn't have native support for copying files into
-        # running containers, so we use docker exec to implement this
-        # Although docker version 1.8 and later provide support, the
-        # owner and group of the files are always set to root
-        with open(to_bytes(in_path, errors='surrogate_or_strict'), 'rb') as in_file:
-            if not os.fstat(in_file.fileno()).st_size:
-                count = ' count=0'
-            else:
-                count = ''
-            args = self._build_exec_cmd([self._play_context.executable, "-c", "dd of=%s bs=%s%s" % (out_path, BUFSIZE, count)])
-            args = [to_bytes(i, errors='surrogate_or_strict') for i in args]
-            try:
-                p = subprocess.Popen(args, stdin=in_file, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            except OSError:
-                raise AnsibleError("docker connection requires dd command in the container to put files")
-            stdout, stderr = p.communicate()
-
-            if p.returncode != 0:
-                raise AnsibleError("failed to transfer file %s to %s:\n%s\n%s" %
-                                   (to_native(in_path), to_native(out_path), to_native(stdout), to_native(stderr)))
+        
+        self.transfer_file(in_path, out_path)
 
     def fetch_file(self, in_path, out_path):
         """ Fetch a file from container to local. """
