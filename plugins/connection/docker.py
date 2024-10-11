@@ -437,6 +437,8 @@ class Connection(ConnectionBase):
         self._set_conn_data()
         super(Connection, self).transfer_file(from_path, to_path)
 
+        display.vvv("TRANSFER %s TO %s" % (from_path, to_path), host=self.get_option('remote_addr'))
+
         # Older docker doesn't have native support for copying files into
         # running containers, so we use docker exec to implement this
         # Although docker version 1.8 and later provide support, the
